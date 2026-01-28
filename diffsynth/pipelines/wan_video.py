@@ -27,7 +27,7 @@ from ..models.wan_video_animate_adapter import WanAnimateAdapter
 from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
-
+from ..models.wan_video_action_encoder import WanActionEncoder
 
 class WanVideoPipeline(BasePipeline):
 
@@ -50,12 +50,14 @@ class WanVideoPipeline(BasePipeline):
         self.vap: MotWanModel = None
         self.animate_adapter: WanAnimateAdapter = None
         self.audio_encoder: WanS2VAudioEncoder = None
-        self.in_iteration_models = ("dit", "motion_controller", "vace", "animate_adapter", "vap")
-        self.in_iteration_models_2 = ("dit2", "motion_controller", "vace2", "animate_adapter", "vap")
+        self.action_encoder: WanActionEncoder = None
+        self.in_iteration_models = ("dit", "motion_controller", "vace", "animate_adapter", "vap","action_encoder")
+        self.in_iteration_models_2 = ("dit2", "motion_controller", "vace2", "animate_adapter", "vap","action_encoder")
         self.units = [
             WanVideoUnit_ShapeChecker(),
             WanVideoUnit_NoiseInitializer(),
             WanVideoUnit_PromptEmbedder(),
+            WanVideoUnit_ActionEmbedder(), 
             WanVideoUnit_S2V(),
             WanVideoUnit_InputVideoEmbedder(),
             WanVideoUnit_ImageEmbedderVAE(),
@@ -152,7 +154,7 @@ class WanVideoPipeline(BasePipeline):
         pipe.vap = model_pool.fetch_model("wan_video_vap")
         pipe.audio_encoder = model_pool.fetch_model("wans2v_audio_encoder")
         pipe.animate_adapter = model_pool.fetch_model("wan_video_animate_adapter")
-
+        pipe.action_encoder = model_pool.fetch_model("wan_video_action_encoder")
         # Size division factor
         if pipe.vae is not None:
             pipe.height_division_factor = pipe.vae.upsampling_factor * 2
@@ -247,6 +249,8 @@ class WanVideoPipeline(BasePipeline):
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Optional[Literal["quantized", "floatpoint"]] = "quantized",
+        # action
+        action_seq: Optional[torch.Tensor] = None,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -280,6 +284,7 @@ class WanVideoPipeline(BasePipeline):
             "input_audio": input_audio, "audio_sample_rate": audio_sample_rate, "s2v_pose_video": s2v_pose_video, "audio_embeds": audio_embeds, "s2v_pose_latents": s2v_pose_latents, "motion_video": motion_video,
             "animate_pose_video": animate_pose_video, "animate_face_video": animate_face_video, "animate_inpaint_video": animate_inpaint_video, "animate_mask_video": animate_mask_video,
             "vap_video": vap_video, 
+            "action_seq": action_seq,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -421,7 +426,39 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         prompt_emb = self.encode_prompt(pipe, prompt)
         return {"context": prompt_emb}
 
+class WanVideoUnit_ActionEmbedder(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("action_seq","num_frames"),
+            output_params=("action_emb",),
+            onload_model_names=("action_encoder",)
+        )
 
+    def process(self, pipe: WanVideoPipeline, action_seq, num_frames):
+        if action_seq is None or pipe.action_encoder is None:
+            return {}
+        pipe.load_models_to_device(self.onload_model_names)
+        # if not isinstance(action_seq, torch.Tensor):
+        #     raise TypeError(f"action_seq must be a torch.Tensor, got {type(action_seq)}")
+        # if action_seq.dim() != 2:
+        #     raise ValueError(f"action_seq must be 2D with shape (T, D), got shape {action_seq.shape}")       
+        T_video, _ = action_seq.shape
+        assert T_video == num_frames, f"action_seq has {T_video} frames, but num_frames={num_frames}"
+
+        # Add batch dimension: (T, D) -> (1, T, D)
+        action_seq = action_seq.unsqueeze(0).to(pipe.device, dtype=pipe.torch_dtype)
+
+        # Encode to DiT dimension
+        action_emb = pipe.action_encoder(action_seq)  # (1, T_video, D)
+
+        # Downsample to latent temporal dimension: T_latent = (num_frames - 1) // 4 + 1
+        T_latent = (num_frames - 1) // 4 + 1
+        if T_video != T_latent:
+            action_emb = torch.nn.functional.interpolate(
+                action_emb.permute(0, 2, 1), size=T_latent, mode='linear'
+            ).permute(0, 2, 1)  # (1, T_latent, D)
+
+        return {"action_emb": action_emb}
 
 class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
     def __init__(self):
@@ -1158,6 +1195,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    action_emb: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1218,23 +1256,100 @@ def model_fn_wan_video(
         from xfuser.core.distributed import (get_sequence_parallel_rank,
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
-
-    # Timestep
-    if dit.seperated_timestep and fuse_vae_embedding_in_latents:
-        timestep = torch.concat([
-            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
-        ]).flatten()
-        t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
-        if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
-            t_chunks = torch.chunk(t, get_sequence_parallel_world_size(), dim=1)
-            t_chunks = [torch.nn.functional.pad(chunk, (0, 0, 0, t_chunks[0].shape[1]-chunk.shape[1]), value=0) for chunk in t_chunks]
-            t = t_chunks[get_sequence_parallel_rank()]
-        t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
-    else:
-        t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
-        t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
     
+    if action_emb is not None:
+        B, T_latent_action, D = action_emb.shape
+        assert D == dit.dim, f"action_emb dim {D} != dit.dim {dit.dim}"
+        
+        # Get spatial dims after patchify
+        H, W = latents.shape[3], latents.shape[4]
+        h = H // dit.patch_size[1]
+        w = W // dit.patch_size[2]
+        S = T_latent_action * h * w  # total sequence length
+        
+        # Broadcast action_emb to all spatial positions: (B, T, D) -> (B, T, h, w, D) -> (B, S, D)
+        action_emb = action_emb.unsqueeze(2).unsqueeze(3)           # (B, T, 1, 1, D)
+        action_emb = action_emb.expand(B, T_latent_action, h, w, D) # (B, T, h, w, D)
+        action_emb = action_emb.reshape(B, S, D)                    # (B, S, D)
+    else:
+        action_emb = None
+
+
+    # # Timestep
+    # if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+    #     timestep = torch.concat([
+    #         torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
+    #         torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
+    #     ]).flatten()
+    #     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
+    #     if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
+    #         t_chunks = torch.chunk(t, get_sequence_parallel_world_size(), dim=1)
+    #         t_chunks = [torch.nn.functional.pad(chunk, (0, 0, 0, t_chunks[0].shape[1]-chunk.shape[1]), value=0) for chunk in t_chunks]
+    #         t = t_chunks[get_sequence_parallel_rank()]
+        
+    #     t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
+    # else:
+    #     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    #     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+
+    # Action Embedding Integration
+    B = latents.shape[0]
+    H, W = latents.shape[3], latents.shape[4]
+    h = H // dit.patch_size[1]
+    w = W // dit.patch_size[2]
+    T_latent = latents.shape[2]
+    S = T_latent * h * w
+
+    # Process action_emb
+    action_emb_provided = action_emb is not None
+    if action_emb_provided:
+        _, T_act, D = action_emb.shape
+        assert T_act == T_latent and D == dit.dim
+        action_emb = action_emb[:, :, None, None, :].expand(B, T_latent, h, w, D).reshape(B, S, D)
+    else:
+        action_emb = None
+
+    # Build time embedding (per-token or global)
+    if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+        per_frame_tokens = h * w
+        timestep_per_token = torch.cat([
+            torch.full((1, per_frame_tokens), 0.0, device=latents.device),
+            timestep.repeat(T_latent - 1, per_frame_tokens)
+        ], dim=0).flatten()  # (S,)
+        t_raw = sinusoidal_embedding_1d(dit.freq_dim, timestep_per_token)  # (S, freq_dim)
+        t = dit.time_embedding(t_raw).unsqueeze(0).expand(B, -1, -1)  # (B, S, D)
+    else:
+        # Global timestep: compute once, expand to all tokens
+        t_raw_global = sinusoidal_embedding_1d(dit.freq_dim, timestep)  # (B, freq_dim)
+        t_global = dit.time_embedding(t_raw_global)  # (B, D)
+        t = t_global.unsqueeze(1).expand(B, S, dit.dim)  # (B, S, D)
+
+    # Fuse action if provided
+    if action_emb_provided:
+        t_fused = t + action_emb
+    else:
+        t_fused = t
+
+    # Project to modulation
+    t_proj_out = dit.time_projection(t_fused.view(B * S, dit.dim))  # (B*S, 6*D)
+    t_mod = t_proj_out.view(B, S, 6, dit.dim)  # (B, S, 6, D)
+
+    # Handle USP sharding
+    if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
+        from xfuser.core.distributed import get_sequence_parallel_world_size, get_sequence_parallel_rank
+        world_size = get_sequence_parallel_world_size()
+        rank = get_sequence_parallel_rank()
+        
+        t_mod_chunks = torch.chunk(t_mod, world_size, dim=1)
+        # Optional: add padding if needed (with caution)
+        max_len = max(c.shape[1] for c in t_mod_chunks)
+        if any(c.shape[1] != max_len for c in t_mod_chunks):
+            t_mod_chunks = [
+                torch.nn.functional.pad(c, (0, 0, 0, 0, 0, max_len - c.shape[1]), value=0)
+                for c in t_mod_chunks
+            ]
+        t_mod = t_mod_chunks[rank]
+
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))

@@ -1,7 +1,8 @@
 import torch, torchvision, imageio, os
+import numpy as np
 import imageio.v3 as iio
 from PIL import Image
-
+from typing import Optional
 
 class DataProcessingPipeline:
     def __init__(self, operators=None):
@@ -218,3 +219,27 @@ class LoadAudio(DataProcessingOperator):
         import librosa
         input_audio, sample_rate = librosa.load(data, sr=self.sr)
         return input_audio
+
+class LoadActionSequence(DataProcessingOperator):
+    def __init__(self, joint_dim: Optional[int] = None):  
+        self.joint_dim = joint_dim
+
+    def __call__(self, path: str):
+        data = np.load(path)
+
+        if data.ndim != 2:
+            raise ValueError(f"Expected action sequence to be 2D (T, joint_dim), got shape {data.shape}")
+
+        inferred_joint_dim = data.shape[1]
+
+        if self.joint_dim is not None:
+            if inferred_joint_dim != self.joint_dim:
+                raise ValueError(
+                    f"Loaded action sequence has joint_dim={inferred_joint_dim}, "
+                    f"but expected {self.joint_dim} (from config)."
+                )
+        else:
+
+            self.joint_dim = inferred_joint_dim
+
+        return torch.from_numpy(data).float()

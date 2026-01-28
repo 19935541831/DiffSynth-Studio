@@ -89,6 +89,12 @@ wan_series = [
         "state_dict_converter": "diffsynth.utils.state_dict_converters.wan_video_dit.WanVideoDiTStateDictConverter",
     },
     {
+        # Example: ModelConfig(model_id="your-org/wan-action-control", origin_file_pattern="action_condition.pth")
+        "model_hash": "b8af9ce489b6012b083487a574ceecc3", 
+        "model_name": "wan_video_action_encoder",
+        "model_class": "diffsynth.models.wan_video_action_encoder.WanActionEncoder",
+    },
+    {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.1-T2V-14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth")
         "model_hash": "9c8818c2cbea55eca56c7b447df170da",
         "model_name": "wan_video_text_encoder",
@@ -129,6 +135,7 @@ wan_series = [
         "model_class": "diffsynth.models.wan_video_image_encoder.WanImageEncoder",
         "state_dict_converter": "diffsynth.utils.state_dict_converters.wan_video_image_encoder.WanImageEncoderStateDictConverter"
     },
+    
     {
         # Example: ModelConfig(model_id="DiffSynth-Studio/Wan2.1-1.3b-speedcontrol-v1", origin_file_pattern="model.safetensors")
         "model_hash": "dbd5ec76bbf977983f972c151d545389",

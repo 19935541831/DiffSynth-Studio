@@ -70,6 +70,8 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared["end_image"] = data["video"][-1]
             elif extra_input == "reference_image" or extra_input == "vace_reference_image":
                 inputs_shared[extra_input] = data[extra_input][0]
+            elif extra_input == "action_seq":  
+                inputs_shared["action_seq"] = data["action_seq"]  
             else:
                 inputs_shared[extra_input] = data[extra_input]
         return inputs_shared
@@ -84,6 +86,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
+            "action_seq": data.get("action_seq", None),
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -117,6 +120,7 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--action_joint_dim", type=int, default=None, help="Dimension of the action sequence vectors (D). If not provided, it will be inferred.")
     return parser
 
 
@@ -146,6 +150,7 @@ if __name__ == "__main__":
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+            "action_seq": ToAbsolutePath(args.dataset_base_path) >> LoadActionSequence(joint_dim=args.action_joint_dim), 
         }
     )
     model = WanTrainingModule(
