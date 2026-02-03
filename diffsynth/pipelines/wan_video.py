@@ -438,10 +438,6 @@ class WanVideoUnit_ActionEmbedder(PipelineUnit):
         if action_seq is None or pipe.action_encoder is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        # if not isinstance(action_seq, torch.Tensor):
-        #     raise TypeError(f"action_seq must be a torch.Tensor, got {type(action_seq)}")
-        # if action_seq.dim() != 2:
-        #     raise ValueError(f"action_seq must be 2D with shape (T, D), got shape {action_seq.shape}")       
         T_video, _ = action_seq.shape
         assert T_video == num_frames, f"action_seq has {T_video} frames, but num_frames={num_frames}"
 
@@ -1257,24 +1253,6 @@ def model_fn_wan_video(
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
     
-    if action_emb is not None:
-        B, T_latent_action, D = action_emb.shape
-        assert D == dit.dim, f"action_emb dim {D} != dit.dim {dit.dim}"
-        
-        # Get spatial dims after patchify
-        H, W = latents.shape[3], latents.shape[4]
-        h = H // dit.patch_size[1]
-        w = W // dit.patch_size[2]
-        S = T_latent_action * h * w  # total sequence length
-        
-        # Broadcast action_emb to all spatial positions: (B, T, D) -> (B, T, h, w, D) -> (B, S, D)
-        action_emb = action_emb.unsqueeze(2).unsqueeze(3)           # (B, T, 1, 1, D)
-        action_emb = action_emb.expand(B, T_latent_action, h, w, D) # (B, T, h, w, D)
-        action_emb = action_emb.reshape(B, S, D)                    # (B, S, D)
-    else:
-        action_emb = None
-
-
     # # Timestep
     # if dit.seperated_timestep and fuse_vae_embedding_in_latents:
     #     timestep = torch.concat([
@@ -1298,41 +1276,57 @@ def model_fn_wan_video(
     h = H // dit.patch_size[1]
     w = W // dit.patch_size[2]
     T_latent = latents.shape[2]
-    S = T_latent * h * w
+    ref_tokens = (h * w) if reference_latents is not None else 0
+    S = T_latent * h * w + ref_tokens
 
     # Process action_emb
     action_emb_provided = action_emb is not None
     if action_emb_provided:
         _, T_act, D = action_emb.shape
-        assert T_act == T_latent and D == dit.dim
-        action_emb = action_emb[:, :, None, None, :].expand(B, T_latent, h, w, D).reshape(B, S, D)
+        assert T_act == T_latent and D == dit.dim, f"action_emb shape mismatch: T={T_act}, D={D}, expected T={T_latent}, D={dit.dim}"
+        action_emb = action_emb[:, :, None, None, :].expand(B, T_latent, h, w, D).reshape(B, T_latent * h * w, D)
+        if ref_tokens > 0:
+            ref_pad = torch.zeros((B, ref_tokens, D), device=action_emb.device, dtype=action_emb.dtype)
+            action_emb = torch.cat([ref_pad, action_emb], dim=1)
     else:
         action_emb = None
 
     # Build time embedding (per-token or global)
-    if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+    if action_emb_provided or (dit.seperated_timestep and fuse_vae_embedding_in_latents):
         per_frame_tokens = h * w
-        timestep_per_token = torch.cat([
-            torch.full((1, per_frame_tokens), 0.0, device=latents.device),
-            timestep.repeat(T_latent - 1, per_frame_tokens)
-        ], dim=0).flatten()  # (S,)
-        t_raw = sinusoidal_embedding_1d(dit.freq_dim, timestep_per_token)  # (S, freq_dim)
-        t = dit.time_embedding(t_raw).unsqueeze(0).expand(B, -1, -1)  # (B, S, D)
+        if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+            timestep_per_token = torch.cat([
+                torch.full((1, per_frame_tokens), 0.0, device=latents.device),
+                timestep.repeat(T_latent - 1, per_frame_tokens)
+            ], dim=0).flatten()  # (T_latent * h * w,)
+            t_raw = sinusoidal_embedding_1d(dit.freq_dim, timestep_per_token)  # (S_no_ref, freq_dim)
+            t = dit.time_embedding(t_raw).unsqueeze(0).expand(B, -1, -1)  # (B, S_no_ref, D)
+        else:
+            # Global timestep: compute once, expand to all tokens
+            t_raw_global = sinusoidal_embedding_1d(dit.freq_dim, timestep)  # (B, freq_dim)
+            t_global = dit.time_embedding(t_raw_global)  # (B, D)
+            t = t_global.unsqueeze(1).expand(B, T_latent * h * w, dit.dim)  # (B, S_no_ref, D)
+
+        if ref_tokens > 0:
+            t_raw_global = sinusoidal_embedding_1d(dit.freq_dim, timestep)  # (B, freq_dim)
+            t_global = dit.time_embedding(t_raw_global)  # (B, D)
+            ref_t = t_global.unsqueeze(1).expand(B, ref_tokens, dit.dim)
+            t = torch.cat([ref_t, t], dim=1)  # (B, S, D)
+
+        # Fuse action if provided
+        if action_emb_provided:
+            t_fused = t + action_emb
+        else:
+            t_fused = t
+
+        # Project to modulation
+        t_proj_out = dit.time_projection(t_fused.view(B * S, dit.dim))  # (B*S, 6*D)
+        t_mod = t_proj_out.view(B, S, 6, dit.dim)  # (B, S, 6, D)
     else:
-        # Global timestep: compute once, expand to all tokens
+        # Global timestep modulation
         t_raw_global = sinusoidal_embedding_1d(dit.freq_dim, timestep)  # (B, freq_dim)
-        t_global = dit.time_embedding(t_raw_global)  # (B, D)
-        t = t_global.unsqueeze(1).expand(B, S, dit.dim)  # (B, S, D)
-
-    # Fuse action if provided
-    if action_emb_provided:
-        t_fused = t + action_emb
-    else:
-        t_fused = t
-
-    # Project to modulation
-    t_proj_out = dit.time_projection(t_fused.view(B * S, dit.dim))  # (B*S, 6*D)
-    t_mod = t_proj_out.view(B, S, 6, dit.dim)  # (B, S, 6, D)
+        t = dit.time_embedding(t_raw_global)  # (B, D)
+        t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
 
     # Handle USP sharding
     if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:

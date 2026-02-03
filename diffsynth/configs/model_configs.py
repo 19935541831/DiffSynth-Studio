@@ -90,9 +90,10 @@ wan_series = [
     },
     {
         # Example: ModelConfig(model_id="your-org/wan-action-control", origin_file_pattern="action_condition.pth")
-        "model_hash": "b8af9ce489b6012b083487a574ceecc3", 
+        "model_hash": "0f8b765feae6ef591aebbd46dfeeda57", 
         "model_name": "wan_video_action_encoder",
         "model_class": "diffsynth.models.wan_video_action_encoder.WanActionEncoder",
+        "extra_kwargs": {"joint_dim": 14, "dit_dim": 5120},
     },
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.1-T2V-14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth")
