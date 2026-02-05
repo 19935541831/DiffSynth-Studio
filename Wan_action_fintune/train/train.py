@@ -120,6 +120,11 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--action_joint_dim", type=int, default=None, help="Dimension of the action sequence vectors (D). If not provided, it will be inferred.")
+    # Sliding window parameters
+    parser.add_argument("--enable_sliding_window", default=False, action="store_true", help="Enable sliding window sampling for long videos.")
+    parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1).")
+    parser.add_argument("--video_key", type=str, default="video", help="Key name for video data in metadata (default: 'video').")
+    parser.add_argument("--action_key", type=str, default="action_seq", help="Key name for action data in metadata (default: 'action_seq').")
     return parser
 
 
@@ -150,7 +155,13 @@ if __name__ == "__main__":
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
             "action_seq": ToAbsolutePath(args.dataset_base_path) >> LoadActionSequence(joint_dim=args.action_joint_dim), 
-        }
+        },
+        # Sliding window parameters
+        enable_sliding_window=args.enable_sliding_window,
+        window_num_frames=args.num_frames if args.enable_sliding_window else None,
+        window_stride=args.window_stride,
+        video_key=args.video_key,
+        action_key=args.action_key,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,

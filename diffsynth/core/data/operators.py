@@ -107,12 +107,13 @@ class ToList(DataProcessingOperator):
     
 
 class LoadVideo(DataProcessingOperator):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, frame_range=None):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
+        self.frame_range = frame_range  # (start_frame, end_frame) or None
         
     def get_num_frames(self, reader):
         num_frames = self.num_frames
@@ -124,13 +125,25 @@ class LoadVideo(DataProcessingOperator):
         
     def __call__(self, data: str):
         reader = imageio.get_reader(data)
-        num_frames = self.get_num_frames(reader)
-        frames = []
-        for frame_id in range(num_frames):
-            frame = reader.get_data(frame_id)
-            frame = Image.fromarray(frame)
-            frame = self.frame_processor(frame)
-            frames.append(frame)
+        
+        # If frame_range is specified, load only that range
+        if self.frame_range is not None:
+            start_frame, end_frame = self.frame_range
+            frames = []
+            for frame_id in range(start_frame, end_frame):
+                frame = reader.get_data(frame_id)
+                frame = Image.fromarray(frame)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+        else:
+            # Original logic: load num_frames
+            num_frames = self.get_num_frames(reader)
+            frames = []
+            for frame_id in range(num_frames):
+                frame = reader.get_data(frame_id)
+                frame = Image.fromarray(frame)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
         reader.close()
         return frames
 
@@ -144,12 +157,13 @@ class SequencialProcess(DataProcessingOperator):
 
 
 class LoadGIF(DataProcessingOperator):
-    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, frame_range=None):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
+        self.frame_range = frame_range  # (start_frame, end_frame) or None
         
     def get_num_frames(self, path):
         num_frames = self.num_frames
@@ -161,15 +175,25 @@ class LoadGIF(DataProcessingOperator):
         return num_frames
         
     def __call__(self, data: str):
-        num_frames = self.get_num_frames(data)
-        frames = []
         images = iio.imread(data, mode="RGB")
-        for img in images:
-            frame = Image.fromarray(img)
-            frame = self.frame_processor(frame)
-            frames.append(frame)
-            if len(frames) >= num_frames:
-                break
+        frames = []
+        
+        # If frame_range is specified, load only that range
+        if self.frame_range is not None:
+            start_frame, end_frame = self.frame_range
+            for frame_id in range(start_frame, min(end_frame, len(images))):
+                frame = Image.fromarray(images[frame_id])
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+        else:
+            # Original logic: load num_frames
+            num_frames = self.get_num_frames(data)
+            for img in images:
+                frame = Image.fromarray(img)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+                if len(frames) >= num_frames:
+                    break
         return frames
 
 
@@ -221,8 +245,9 @@ class LoadAudio(DataProcessingOperator):
         return input_audio
 
 class LoadActionSequence(DataProcessingOperator):
-    def __init__(self, joint_dim: Optional[int] = None):  
+    def __init__(self, joint_dim: Optional[int] = None, frame_range: Optional[tuple] = None):  
         self.joint_dim = joint_dim
+        self.frame_range = frame_range  # (start_frame, end_frame) or None
 
     def __call__(self, path: str):
         data = np.load(path)
@@ -239,7 +264,11 @@ class LoadActionSequence(DataProcessingOperator):
                     f"but expected {self.joint_dim} (from config)."
                 )
         else:
-
             self.joint_dim = inferred_joint_dim
+
+        # If frame_range is specified, extract only that range
+        if self.frame_range is not None:
+            start_frame, end_frame = self.frame_range
+            data = data[start_frame:end_frame]
 
         return torch.from_numpy(data).float()
