@@ -230,9 +230,9 @@ def find_episodes(raw_data_dir: str) -> List[Tuple[str, int, str, str, str]]:
             continue
         
         task_name = task_dir.name
-        video_dir = task_dir / "video"
-        data_dir = task_dir / "data"
-        instr_dir = task_dir / "instructions"
+        video_dir = task_dir / "aloha-agilex_clean_50" / "video"
+        data_dir = task_dir / "aloha-agilex_clean_50" / "data"
+        instr_dir = task_dir / "aloha-agilex_clean_50" / "instructions"
         
         if not (video_dir.exists() and data_dir.exists() and instr_dir.exists()):
             print(f"Warning: Skipping {task_name} - missing required subdirectories")
