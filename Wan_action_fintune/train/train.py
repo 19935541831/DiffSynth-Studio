@@ -1,6 +1,9 @@
-import torch, os, argparse, accelerate, warnings
-from diffsynth.core import UnifiedDataset
-from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath, LoadActionSequence
+import torch, os, argparse, accelerate, warnings, glob
+from diffsynth.core.data.operators import ImageCropAndResize
+from diffsynth.core.data.parquet_streaming_dataset import (
+    ParquetStreamingDataset,
+    collate_robot_batch,
+)
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -120,12 +123,129 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--action_joint_dim", type=int, default=None, help="Dimension of the action sequence vectors (D). If not provided, it will be inferred.")
-    # Sliding window parameters
-    parser.add_argument("--enable_sliding_window", default=False, action="store_true", help="Enable sliding window sampling for long videos.")
-    parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1).")
-    parser.add_argument("--video_key", type=str, default="video", help="Key name for video data in metadata (default: 'video').")
-    parser.add_argument("--action_key", type=str, default="action_seq", help="Key name for action data in metadata (default: 'action_seq').")
+    # Parquet streaming dataloader parameters
+    parser.add_argument("--parquet_dir", type=str, required=True, help="Directory containing Parquet shard files.")
+    parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1, maximum overlap).")
+    parser.add_argument("--shuffle_buffer_size", type=int, default=1000, help="Size of shuffle buffer for streaming randomization (default: 1000).")
+    parser.add_argument("--dataloader_seed", type=int, default=None, help="Random seed for dataloader shuffling.")
+    # TensorBoard parameters
+    parser.add_argument("--enable_tensorboard", default=True, action="store_true", help="Enable TensorBoard logging.")
+    parser.add_argument("--disable_tensorboard", dest="enable_tensorboard", action="store_false", help="Disable TensorBoard logging.")
+    parser.add_argument("--tensorboard_log_interval", type=int, default=10, help="Log metrics to TensorBoard every N steps (default: 10).")
     return parser
+
+
+def create_dataset(args):
+    """
+    Create Parquet streaming dataset for action-conditioned Wan model training.
+    
+    Args:
+        args: Command-line arguments
+    
+    Returns:
+        ParquetStreamingDataset instance
+    """
+    # Find Parquet shard files
+    parquet_paths = sorted(glob.glob(os.path.join(args.parquet_dir, "*.parquet")))
+    
+    if not parquet_paths:
+        raise ValueError(f"No Parquet files found in {args.parquet_dir}")
+    
+    print(f"Using Parquet streaming dataloader:")
+    print(f"  Shards: {len(parquet_paths)}")
+    print(f"  Window size: {args.num_frames} frames")
+    print(f"  Window stride: {args.window_stride}")
+    print(f"  Shuffle buffer: {args.shuffle_buffer_size}")
+    
+    # Create frame transform
+    frame_transform = ImageCropAndResize(
+        height=args.height,
+        width=args.width,
+        max_pixels=args.max_pixels,
+        height_division_factor=16,
+        width_division_factor=16,
+    )
+    
+    # Create streaming dataset
+    dataset = ParquetStreamingDataset(
+        parquet_paths=parquet_paths,
+        window_size=args.num_frames,
+        window_stride=args.window_stride,
+        shuffle_buffer_size=args.shuffle_buffer_size,
+        frame_transform=frame_transform,
+        action_dim=args.action_joint_dim,
+        seed=args.dataloader_seed,
+    )
+    
+    return dataset
+
+
+def launch_streaming_training_task(
+    accelerator: accelerate.Accelerator,
+    dataset: torch.utils.data.IterableDataset,
+    model: DiffusionTrainingModule,
+    model_logger: ModelLogger,
+    learning_rate: float = 1e-5,
+    weight_decay: float = 1e-2,
+    num_workers: int = 4,
+    save_steps: int = None,
+    num_epochs: int = 1,
+    args = None,
+):
+    """
+    Training launcher optimized for streaming (IterableDataset) datasets.
+    
+    Key differences from standard launcher:
+    - No shuffle (streaming handles its own randomization)
+    - Uses collate_robot_batch for proper batching
+    - Supports prefetching and persistent workers
+    """
+    from tqdm import tqdm
+    
+    if args is not None:
+        learning_rate = args.learning_rate
+        weight_decay = args.weight_decay
+        num_workers = args.dataset_num_workers
+        save_steps = args.save_steps
+        num_epochs = args.num_epochs
+    
+    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    
+    # Create dataloader for streaming dataset
+    # Note: shuffle=False for IterableDataset (it handles its own shuffling)
+    dataloader_kwargs = {
+        "batch_size": 1,  # Each sample is already a window
+        "num_workers": num_workers,
+        "collate_fn": lambda batch: batch[0],  # Unwrap single item
+        "pin_memory": True,
+    }
+    
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 2
+        dataloader_kwargs["persistent_workers"] = True
+    
+    dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+    
+    # Note: Do NOT prepare the dataloader with accelerator.
+    # The IterableDataset handles its own shard partitioning, and accelerate's
+    # prepare() would try to concatenate PIL Images in the batch, causing:
+    #   TypeError: Can only concatenate tensors but got <class 'PIL.Image.Image'>
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    
+    for epoch_id in range(num_epochs):
+        for data in tqdm(dataloader, desc=f"Epoch {epoch_id + 1}/{num_epochs}", total=len(dataset)):
+            with accelerator.accumulate(model):
+                optimizer.zero_grad()
+                loss = model(data)
+                accelerator.backward(loss)
+                optimizer.step()
+                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1)
+                scheduler.step()
+        if save_steps is None:
+            model_logger.on_epoch_end(accelerator, model, epoch_id)
+    model_logger.on_training_end(accelerator, model, save_steps)
+    model_logger.close()
 
 
 if __name__ == "__main__":
@@ -135,34 +255,11 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-            num_frames=args.num_frames,
-            time_division_factor=4,
-            time_division_remainder=1,
-        ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "action_seq": ToAbsolutePath(args.dataset_base_path) >> LoadActionSequence(joint_dim=args.action_joint_dim), 
-        },
-        # Sliding window parameters
-        enable_sliding_window=args.enable_sliding_window,
-        window_num_frames=args.num_frames if args.enable_sliding_window else None,
-        window_stride=args.window_stride,
-        video_key=args.video_key,
-        action_key=args.action_key,
-    )
+    
+    # Create Parquet streaming dataset
+    dataset = create_dataset(args)
+    
+    # Create model
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -185,16 +282,18 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
+    
+    # Create model logger
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        enable_tensorboard=args.enable_tensorboard,
+        log_interval=args.tensorboard_log_interval,
     )
-    launcher_map = {
-        "sft:data_process": launch_data_process_task,
-        "direct_distill:data_process": launch_data_process_task,
-        "sft": launch_training_task,
-        "sft:train": launch_training_task,
-        "direct_distill": launch_training_task,
-        "direct_distill:train": launch_training_task,
-    }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    
+    # Launch training with streaming dataloader
+    supported_tasks = ["sft", "sft:train", "direct_distill", "direct_distill:train"]
+    if args.task not in supported_tasks:
+        raise ValueError(f"Task '{args.task}' is not supported. Supported tasks: {supported_tasks}")
+    
+    launch_streaming_training_task(accelerator, dataset, model, model_logger, args=args)
