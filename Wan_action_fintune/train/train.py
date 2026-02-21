@@ -128,6 +128,7 @@ def wan_parser():
     parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1, maximum overlap).")
     parser.add_argument("--shuffle_buffer_size", type=int, default=1000, help="Size of shuffle buffer for streaming randomization (default: 1000).")
     parser.add_argument("--dataloader_seed", type=int, default=None, help="Random seed for dataloader shuffling.")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Number of samples to prefetch (default: 2).")
     # TensorBoard parameters
     parser.add_argument("--enable_tensorboard", default=True, action="store_true", help="Enable TensorBoard logging.")
     parser.add_argument("--disable_tensorboard", dest="enable_tensorboard", action="store_false", help="Disable TensorBoard logging.")
@@ -195,10 +196,16 @@ def launch_streaming_training_task(
     """
     Training launcher optimized for streaming (IterableDataset) datasets.
     
-    Key differences from standard launcher:
-    - No shuffle (streaming handles its own randomization)
-    - Uses collate_robot_batch for proper batching
+    Key features:
+    - Full distributed training support (multi-GPU/multi-node)
+    - Automatic shard partitioning across ranks and workers
+    - Epoch-aware shuffling for proper data randomization
+    - No explicit shuffle (streaming handles its own randomization)
     - Supports prefetching and persistent workers
+    
+    Note: The dataloader is NOT prepared with accelerator.prepare() because:
+    1. IterableDataset handles its own distributed shard partitioning
+    2. accelerate would try to concatenate PIL Images, causing errors
     """
     from tqdm import tqdm
     
@@ -222,7 +229,7 @@ def launch_streaming_training_task(
     }
     
     if num_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = 2
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
         dataloader_kwargs["persistent_workers"] = True
     
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
@@ -231,10 +238,38 @@ def launch_streaming_training_task(
     # The IterableDataset handles its own shard partitioning, and accelerate's
     # prepare() would try to concatenate PIL Images in the batch, causing:
     #   TypeError: Can only concatenate tensors but got <class 'PIL.Image.Image'>
+    
+    # For DeepSpeed: manually set batch size since we don't prepare the dataloader
+    if accelerator.state.deepspeed_plugin is not None:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = 1
+    
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     
+    # Log distributed training info
+    if accelerator.is_main_process:
+        print(f"Distributed training setup:")
+        print(f"  World size: {accelerator.num_processes}")
+        print(f"  DataLoader workers per rank: {num_workers}")
+        print(f"  Estimated samples per rank: {len(dataset)}")
+    
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader, desc=f"Epoch {epoch_id + 1}/{num_epochs}", total=len(dataset)):
+        # Set epoch for proper distributed shuffling
+        # This ensures each epoch has different shard order while being consistent across ranks
+        if hasattr(dataset, 'set_epoch'):
+            dataset.set_epoch(epoch_id)
+        
+        # Synchronize all processes before starting epoch
+        accelerator.wait_for_everyone()
+        
+        if accelerator.is_main_process:
+            print(f"\nStarting epoch {epoch_id + 1}/{num_epochs}")
+        
+        for data in tqdm(
+            dataloader, 
+            desc=f"Epoch {epoch_id + 1}/{num_epochs}", 
+            total=len(dataset),
+            disable=not accelerator.is_main_process,  # Only show progress on main process
+        ):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
@@ -242,8 +277,13 @@ def launch_streaming_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1)
                 scheduler.step()
+        
+        # Synchronize at end of epoch
+        accelerator.wait_for_everyone()
+        
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+    
     model_logger.on_training_end(accelerator, model, save_steps)
     model_logger.close()
 

@@ -28,8 +28,10 @@ Usage:
 """
 
 import io
+import os
 import random
 import torch
+import torch.distributed as dist
 import numpy as np
 from PIL import Image
 from collections import deque
@@ -316,7 +318,19 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         - On-the-fly sliding window generation
         - Shuffle buffer for streaming randomization
         - Automatic multi-worker shard partitioning
+        - Full distributed training support (multi-GPU/multi-node)
         - Optional frame transformation
+    
+    Distributed Training:
+        The dataset implements two-level shard partitioning:
+        1. First level: Shards are divided among distributed ranks (GPUs/nodes)
+        2. Second level: Each rank's shards are further divided among DataLoader workers
+        
+        Use set_epoch() at the start of each epoch to ensure proper shuffling:
+            for epoch in range(num_epochs):
+                dataset.set_epoch(epoch)
+                for batch in dataloader:
+                    ...
     
     Output format per sample:
         {
@@ -361,8 +375,11 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         self.frame_transform = frame_transform
         self.action_dim = action_dim
         self.use_gpu_decode = use_gpu_decode
-        self.seed = seed
+        self.seed = seed if seed is not None else 42
         self.shuffle_shards = shuffle_shards
+        
+        # Epoch counter for distributed training synchronization
+        self.epoch = 0
         
         # Validate
         if not self.parquet_paths:
@@ -371,12 +388,17 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         # Pre-compute estimated total number of windows for __len__ / tqdm
         self._estimated_length = self._compute_total_windows()
         
-        print(f"ParquetStreamingDataset initialized:")
-        print(f"  Shards: {len(self.parquet_paths)}")
+        # Get distributed info for logging
+        rank, world_size = self._get_distributed_info()
+        
+        print(f"ParquetStreamingDataset initialized (rank {rank}/{world_size}):")
+        print(f"  Total shards: {len(self.parquet_paths)}")
         print(f"  Window size: {window_size}")
         print(f"  Window stride: {window_stride}")
         print(f"  Shuffle buffer: {shuffle_buffer_size}")
-        print(f"  Estimated windows: {self._estimated_length}")
+        print(f"  Estimated total windows: {self._estimated_length}")
+        if world_size > 1:
+            print(f"  Estimated windows per rank: ~{self._estimated_length // world_size}")
     
     def _compute_total_windows(self) -> int:
         """
@@ -409,38 +431,122 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         return total_windows
     
     def __len__(self) -> int:
-        """Return the estimated total number of windows (for tqdm progress bars)."""
+        """
+        Return the estimated number of windows for this rank (for tqdm progress bars).
+        
+        In distributed training, returns the per-rank estimate.
+        """
+        rank, world_size = self._get_distributed_info()
+        if world_size > 1:
+            return self._estimated_length // world_size
         return self._estimated_length
     
-    def _get_worker_shards(self) -> List[str]:
-        """Get the shard paths assigned to this worker."""
-        worker_info = torch.utils.data.get_worker_info()
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Set the epoch for this dataset.
         
-        shards = self.parquet_paths.copy()
+        This ensures that shuffling is different across epochs while being
+        consistent across all distributed processes within the same epoch.
         
-        # Shuffle shards for this epoch
-        if self.shuffle_shards:
-            if self.seed is not None:
-                random.seed(self.seed)
-            random.shuffle(shards)
+        Args:
+            epoch: The current epoch number
         
-        if worker_info is None:
-            # Single worker: use all shards
+        Example:
+            for epoch in range(num_epochs):
+                dataset.set_epoch(epoch)
+                for batch in dataloader:
+                    train_step(batch)
+        """
+        self.epoch = epoch
+    
+    def _get_distributed_info(self) -> Tuple[int, int]:
+        """
+        Get the current process rank and world size for distributed training.
+        
+        Returns:
+            Tuple of (rank, world_size). Returns (0, 1) for non-distributed training.
+        """
+        # First, try torch.distributed if available and initialized
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        
+        # Fall back to environment variables (set by accelerate/torchrun/etc.)
+        # Check multiple common environment variable names
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
+        return rank, world_size
+    
+    def _partition_shards(self, shards: List[str], partition_id: int, num_partitions: int) -> List[str]:
+        """
+        Partition shards evenly among partitions using interleaved assignment.
+        
+        Interleaved assignment (round-robin) provides better load balancing than
+        contiguous assignment when shards have varying sizes.
+        
+        Args:
+            shards: List of shard paths to partition
+            partition_id: ID of this partition (0-indexed)
+            num_partitions: Total number of partitions
+        
+        Returns:
+            List of shard paths assigned to this partition
+        """
+        if num_partitions <= 1:
             return shards
         
-        # Multi-worker: partition shards
-        num_workers = worker_info.num_workers
-        worker_id = worker_info.id
+        # Interleaved assignment: shard i goes to partition (i % num_partitions)
+        return [s for i, s in enumerate(shards) if i % num_partitions == partition_id]
+    
+    def _get_rank_shards(self) -> List[str]:
+        """
+        Get shards assigned to this distributed rank.
         
-        # Distribute shards evenly
-        per_worker = len(shards) // num_workers
-        remainder = len(shards) % num_workers
+        First shuffles all shards with a seed based on base_seed + epoch,
+        then partitions among ranks.
         
-        # Calculate start and end indices for this worker
-        start_idx = worker_id * per_worker + min(worker_id, remainder)
-        end_idx = start_idx + per_worker + (1 if worker_id < remainder else 0)
+        Returns:
+            List of shard paths for this rank
+        """
+        shards = self.parquet_paths.copy()
         
-        return shards[start_idx:end_idx]
+        # Shuffle with epoch-dependent seed for different order each epoch
+        # All ranks use the same seed so they get the same shuffle order
+        if self.shuffle_shards:
+            epoch_seed = self.seed + self.epoch
+            rng = random.Random(epoch_seed)
+            rng.shuffle(shards)
+        
+        # Partition among distributed ranks
+        rank, world_size = self._get_distributed_info()
+        return self._partition_shards(shards, rank, world_size)
+    
+    def _get_worker_shards(self) -> List[str]:
+        """
+        Get shards assigned to this DataLoader worker.
+        
+        This implements two-level partitioning:
+        1. First, shards are partitioned among distributed ranks (_get_rank_shards)
+        2. Then, each rank's shards are partitioned among DataLoader workers
+        
+        Returns:
+            List of shard paths for this specific worker
+        """
+        # First level: get shards for this rank
+        rank_shards = self._get_rank_shards()
+        
+        if not rank_shards:
+            return []
+        
+        # Second level: partition among DataLoader workers
+        worker_info = torch.utils.data.get_worker_info()
+        
+        if worker_info is None:
+            # Single worker: use all rank shards
+            return rank_shards
+        
+        # Multi-worker: partition this rank's shards among workers
+        return self._partition_shards(rank_shards, worker_info.id, worker_info.num_workers)
     
     def _stream_rows_from_shards(self, shard_paths: List[str]) -> Iterator[Dict[str, Any]]:
         """Stream rows from Parquet shards."""
@@ -518,6 +624,16 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         if not shard_paths:
             return
         
+        # Compute worker-specific seed for shuffle buffer
+        # This ensures different workers have different shuffle patterns
+        rank, world_size = self._get_distributed_info()
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        
+        # Combine epoch, rank, and worker_id for unique seed per worker per epoch
+        worker_seed = self.seed + self.epoch * 10000 + rank * 1000 + worker_id
+        
         # Initialize components
         window_iter = SlidingWindowIterator(
             window_size=self.window_size,
@@ -525,7 +641,7 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         )
         shuffle_buffer = ShuffleBuffer(
             buffer_size=self.shuffle_buffer_size,
-            seed=self.seed,
+            seed=worker_seed,
         )
         
         # Stream through shards

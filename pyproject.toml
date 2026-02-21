@@ -25,6 +25,10 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
+    "tensorboard",
+    "pyarrow",
+    "h5py",
+    "opencv-python"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
