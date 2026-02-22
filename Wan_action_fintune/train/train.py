@@ -1,5 +1,9 @@
 import torch, os, argparse, accelerate, warnings, glob
+import datetime
 from diffsynth.core.data.operators import ImageCropAndResize
+
+# Set default NCCL config if not already set via environment
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
 from diffsynth.core.data.parquet_streaming_dataset import (
     ParquetStreamingDataset,
     collate_robot_batch,
@@ -128,11 +132,13 @@ def wan_parser():
     parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1, maximum overlap).")
     parser.add_argument("--shuffle_buffer_size", type=int, default=1000, help="Size of shuffle buffer for streaming randomization (default: 1000).")
     parser.add_argument("--dataloader_seed", type=int, default=None, help="Random seed for dataloader shuffling.")
-    parser.add_argument("--prefetch_factor", type=int, default=2, help="Number of samples to prefetch (default: 2).")
-    # TensorBoard parameters
-    parser.add_argument("--enable_tensorboard", default=True, action="store_true", help="Enable TensorBoard logging.")
-    parser.add_argument("--disable_tensorboard", dest="enable_tensorboard", action="store_false", help="Disable TensorBoard logging.")
-    parser.add_argument("--tensorboard_log_interval", type=int, default=10, help="Log metrics to TensorBoard every N steps (default: 10).")
+    parser.add_argument("--prefetch_factor", type=int, default=4, help="Number of batches to prefetch per worker (default: 4).")
+    # WandB parameters
+    parser.add_argument("--enable_wandb", default=True, action="store_true", help="Enable WandB logging.")
+    parser.add_argument("--disable_wandb", dest="enable_wandb", action="store_false", help="Disable WandB logging.")
+    parser.add_argument("--wandb_log_interval", type=int, default=10, help="Log metrics to WandB every N steps (default: 10).")
+    parser.add_argument("--wandb_project", type=str, default="wan-action-finetune", help="WandB project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name (auto-generated if not provided).")
     return parser
 
 
@@ -229,7 +235,8 @@ def launch_streaming_training_task(
     }
     
     if num_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        prefetch = args.prefetch_factor if args is not None else 4
+        dataloader_kwargs["prefetch_factor"] = prefetch
         dataloader_kwargs["persistent_workers"] = True
     
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
@@ -253,8 +260,7 @@ def launch_streaming_training_task(
         print(f"  Estimated samples per rank: {len(dataset)}")
     
     for epoch_id in range(num_epochs):
-        # Set epoch for proper distributed shuffling
-        # This ensures each epoch has different shard order while being consistent across ranks
+    
         if hasattr(dataset, 'set_epoch'):
             dataset.set_epoch(epoch_id)
         
@@ -291,9 +297,20 @@ def launch_streaming_training_task(
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    
+    # Create DDP kwargs with extended timeout to prevent NCCL errors
+    ddp_kwargs = accelerate.DistributedDataParallelKwargs(
+        find_unused_parameters=args.find_unused_parameters,
+    )
+    
+    # InitProcessGroupKwargs with extended timeout
+    init_kwargs = accelerate.InitProcessGroupKwargs(
+        timeout=datetime.timedelta(hours=2),
+    )
+    
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
+        kwargs_handlers=[ddp_kwargs, init_kwargs],
     )
     
     # Create Parquet streaming dataset
@@ -323,12 +340,25 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
     )
     
-    # Create model logger
+    # Create model logger (only initialize wandb on main process)
+    wandb_config = {
+        "learning_rate": args.learning_rate,
+        "num_epochs": args.num_epochs,
+        "num_frames": args.num_frames,
+        "height": args.height,
+        "width": args.width,
+        "lora_rank": args.lora_rank,
+        "trainable_models": args.trainable_models,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+    }
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        enable_tensorboard=args.enable_tensorboard,
-        log_interval=args.tensorboard_log_interval,
+        enable_wandb=args.enable_wandb and accelerator.is_main_process,
+        log_interval=args.wandb_log_interval,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_config=wandb_config,
     )
     
     # Launch training with streaming dataloader

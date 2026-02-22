@@ -1,7 +1,8 @@
 MODEL_DIR="/opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/checkpoints/Wan2.1-I2V-14B-480P"
+export NCCL_DEBUG=WARN
+export NCCL_TIMEOUT=7200000
 
-accelerate launch --main_process_port=51631 --config_file /opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/train/accelerate_config_14B.yaml \
-  /opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/train/train.py \
+accelerate launch --main_process_port=51631 /opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/train/train.py \
   --dataset_base_path /opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/data/robotwin_expert50_train \
   --parquet_dir /opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/data/robotwin_expert50_train \
   --height 240 \
@@ -23,10 +24,10 @@ accelerate launch --main_process_port=51631 --config_file /opt/tiger/wan_action_
 ]" \
   --tokenizer_path "${MODEL_DIR}/google/umt5-xxl" \
   --learning_rate 1e-4 \
-  --num_epochs 2 \
+  --num_epochs 5 \
   --num_frames 17 \
-  --dataset_num_worker 16 \
-  --prefetch_factor 2 \
+  --dataset_num_worker 8 \
+  --prefetch_factor 8 \
   --dataloader_seed 42 \
   --remove_prefix_in_ckpt "pipe.dit." \
   --output_path "/opt/tiger/wan_action_finetune_workspace/DiffSynth-Studio/Wan_action_fintune/checkpoints/Wan2.1-I2V-14B-480P_lora" \
@@ -36,5 +37,5 @@ accelerate launch --main_process_port=51631 --config_file /opt/tiger/wan_action_
   --lora_rank 32 \
   --window_stride 5 \
   --shuffle_buffer_size 10000 \
-  --extra_inputs "input_image,action_seq"
+  --extra_inputs "input_image,action_seq" \
 
