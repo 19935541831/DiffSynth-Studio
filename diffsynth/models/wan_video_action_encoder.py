@@ -17,6 +17,8 @@ class WanActionEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(dit_dim, dit_dim)
         )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, action_seq: torch.Tensor) -> torch.Tensor:
         """

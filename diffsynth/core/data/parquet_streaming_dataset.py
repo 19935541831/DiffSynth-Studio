@@ -30,15 +30,16 @@ Usage:
 import io
 import os
 import random
+import time
 import torch
 import torch.distributed as dist
 import numpy as np
 from PIL import Image
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Callable, Iterator, Tuple
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
-
 
 class SlidingWindowIterator:
     """
@@ -264,7 +265,7 @@ class FrameDecoder:
         try:
             from turbojpeg import TurboJPEG
             self._turbo = TurboJPEG()
-        except (ImportError, OSError):
+        except (ImportError, OSError, RuntimeError):
             pass
         
         # Check for GPU decoding support
@@ -302,12 +303,19 @@ class FrameDecoder:
         """
         Decode a batch of JPEG bytes to PIL Images.
         
+        Uses a thread pool when TurboJPEG is available (it releases the GIL),
+        giving ~2-4x speedup for typical window sizes (e.g. 17 frames).
+        Falls back to sequential decoding for PIL (GIL-bound).
+        
         Args:
             jpeg_bytes_list: List of JPEG-compressed bytes
         
         Returns:
             List of PIL Images in RGB format
         """
+        if self._turbo is not None and len(jpeg_bytes_list) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(jpeg_bytes_list))) as pool:
+                return list(pool.map(self.decode, jpeg_bytes_list))
         return [self.decode(b) for b in jpeg_bytes_list]
     
     def decode_to_tensor(self, jpeg_bytes: bytes) -> torch.Tensor:
@@ -574,27 +582,44 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         # Multi-worker: partition this rank's shards among workers
         return self._partition_shards(rank_shards, worker_info.id, worker_info.num_workers)
     
-    _STREAM_BATCH_SIZE = 512
+    _STREAM_BATCH_SIZE = 256
+    _STREAM_COLUMNS = ["episode_id", "task_name", "instruction", "frame_idx", "frame_data", "action"]
 
     def _stream_rows_from_shards(self, shard_paths: List[str]) -> Iterator[Dict[str, Any]]:
-        """Stream rows from Parquet shards in small batches to bound memory."""
+        """Stream rows from Parquet shards in small batches to bound memory.
+
+        Uses column projection to only read needed columns and a moderate
+        batch size to limit per-batch memory from binary frame data.
+        """
         for shard_path in shard_paths:
             try:
                 pf = pq.ParquetFile(shard_path, memory_map=True)
-                
-                for batch in pf.iter_batches(batch_size=self._STREAM_BATCH_SIZE):
-                    columns = batch.to_pydict()
+
+                for batch in pf.iter_batches(
+                    batch_size=self._STREAM_BATCH_SIZE,
+                    columns=self._STREAM_COLUMNS,
+                ):
+                    episode_ids = batch.column("episode_id").to_pylist()
+                    task_names = batch.column("task_name").to_pylist()
+                    instructions = batch.column("instruction").to_pylist()
+                    frame_indices = batch.column("frame_idx").to_pylist()
+                    frame_datas = batch.column("frame_data").to_pylist()
+                    actions = batch.column("action").to_pylist()
+
                     for i in range(batch.num_rows):
                         yield {
-                            "episode_id": columns["episode_id"][i],
-                            "task_name": columns["task_name"][i],
-                            "instruction": columns["instruction"][i],
-                            "frame_idx": columns["frame_idx"][i],
-                            "frame_data": columns["frame_data"][i],
-                            "action": columns["action"][i],
+                            "episode_id": episode_ids[i],
+                            "task_name": task_names[i],
+                            "instruction": instructions[i],
+                            "frame_idx": frame_indices[i],
+                            "frame_data": frame_datas[i],
+                            "action": actions[i],
                         }
+                    del episode_ids, task_names, instructions, frame_indices, frame_datas, actions
             except Exception as e:
                 print(f"Warning: Error reading {shard_path}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
     
     def _process_window(
@@ -651,21 +676,22 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         """
         # Get shards for this worker
         shard_paths = self._get_worker_shards()
-        
-        if not shard_paths:
-            return
-        
-        # Compute worker-specific seed for shuffle buffer
-        # This ensures different workers have different shuffle patterns
         rank, world_size = self._get_distributed_info()
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
         
-        # Combine epoch, rank, and worker_id for unique seed per worker per epoch
+        if not shard_paths:
+            print(f"[rank {rank} worker {worker_id}] WARNING: no shards assigned, yielding nothing")
+            return
+        
+        print(
+            f"[rank {rank} worker {worker_id}] epoch {self.epoch}: "
+            f"{len(shard_paths)} shards assigned"
+        )
+        
         worker_seed = self.seed + self.epoch * 10000 + rank * 1000 + worker_id
         
-        # Initialize components
         window_iter = SlidingWindowIterator(
             window_size=self.window_size,
             stride=self.window_stride,
@@ -675,12 +701,16 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
             seed=worker_seed,
         )
         
-        # Create decoder once per worker (avoids repeated TurboJPEG init overhead)
         decoder = FrameDecoder(use_gpu=self.use_gpu_decode)
         
-        # Stream through shards — shuffle RAW windows (JPEG bytes) to avoid
-        # holding decoded PIL Images in the buffer (10-20x memory reduction).
+        emitted_count = 0
+        rows_read = 0
+        windows_generated = 0
+        iter_start = time.time()
+        last_log_time = iter_start
+
         for row in self._stream_rows_from_shards(shard_paths):
+            rows_read += 1
             window = window_iter.add_frame(
                 frame_data=row["frame_data"],
                 action=row["action"],
@@ -691,9 +721,23 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
             )
             
             if window is not None:
+                windows_generated += 1
                 output = shuffle_buffer.add_and_sample(window)
                 if output is not None:
+                    emitted_count += 1
                     yield self._process_window(output, decoder=decoder)
+            
+            # Periodic progress log (every 60s) to help diagnose stalls
+            now = time.time()
+            if now - last_log_time > 60.0:
+                elapsed = now - iter_start
+                print(
+                    f"[rank {rank} worker {worker_id}] "
+                    f"rows={rows_read} windows={windows_generated} "
+                    f"emitted={emitted_count} elapsed={elapsed:.0f}s "
+                    f"rate={emitted_count / max(elapsed, 1):.1f} samples/s"
+                )
+                last_log_time = now
         
         # Flush remaining window at end
         final_window = window_iter.flush()
@@ -702,7 +746,15 @@ class ParquetStreamingDataset(torch.utils.data.IterableDataset):
         
         # Flush shuffle buffer — decode on yield
         for item in shuffle_buffer.flush():
+            emitted_count += 1
             yield self._process_window(item, decoder=decoder)
+        
+        elapsed = time.time() - iter_start
+        print(
+            f"[rank {rank} worker {worker_id}] epoch {self.epoch} done: "
+            f"rows={rows_read} windows={windows_generated} "
+            f"emitted={emitted_count} elapsed={elapsed:.0f}s"
+        )
 
 
 def collate_robot_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:

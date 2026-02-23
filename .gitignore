@@ -2,6 +2,7 @@
 /models
 /scripts
 /diffusers
+*/checkpoints
 *.pkl
 *.safetensors
 *.pth
@@ -11,6 +12,11 @@
 *.DS_Store
 *.msc
 *.mv
+*.json
+*.mp4
+*.hdf5
+*.csv
+*.parquet
 log*.txt
 
 # Byte-compiled / optimized / DLL files

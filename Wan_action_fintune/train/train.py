@@ -1,5 +1,6 @@
-import torch, os, argparse, accelerate, warnings, glob
+import torch, os, argparse, accelerate, warnings, glob, time
 import datetime
+import torch.distributed as dist
 from diffsynth.core.data.operators import ImageCropAndResize
 
 # Set default NCCL config if not already set via environment
@@ -11,6 +12,10 @@ from diffsynth.core.data.parquet_streaming_dataset import (
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _unwrap_single_item(batch):
+    return batch[0]
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -133,6 +138,7 @@ def wan_parser():
     parser.add_argument("--shuffle_buffer_size", type=int, default=1000, help="Size of shuffle buffer for streaming randomization (default: 1000).")
     parser.add_argument("--dataloader_seed", type=int, default=None, help="Random seed for dataloader shuffling.")
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Number of batches to prefetch per worker (default: 4).")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping. Set <=0 to disable clipping.")
     # WandB parameters
     parser.add_argument("--enable_wandb", default=True, action="store_true", help="Enable WandB logging.")
     parser.add_argument("--disable_wandb", dest="enable_wandb", action="store_false", help="Disable WandB logging.")
@@ -230,14 +236,16 @@ def launch_streaming_training_task(
     dataloader_kwargs = {
         "batch_size": 1,  # Each sample is already a window
         "num_workers": num_workers,
-        "collate_fn": lambda batch: batch[0],  # Unwrap single item
+        "collate_fn": _unwrap_single_item,
         "pin_memory": True,
+        "timeout": 300,  # 5-minute timeout per batch to detect hung workers
     }
     
     if num_workers > 0:
         prefetch = args.prefetch_factor if args is not None else 4
         dataloader_kwargs["prefetch_factor"] = prefetch
         dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["multiprocessing_context"] = "spawn"
     
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
     
@@ -251,6 +259,8 @@ def launch_streaming_training_task(
         accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = 1
     
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    global_step = 0
+    is_distributed = accelerator.num_processes > 1
     
     # Log distributed training info
     if accelerator.is_main_process:
@@ -258,6 +268,8 @@ def launch_streaming_training_task(
         print(f"  World size: {accelerator.num_processes}")
         print(f"  DataLoader workers per rank: {num_workers}")
         print(f"  Estimated samples per rank: {len(dataset)}")
+        if is_distributed:
+            print(f"  Rank-sync enabled: ranks will stop together to prevent DDP deadlock")
     
     for epoch_id in range(num_epochs):
     
@@ -270,22 +282,66 @@ def launch_streaming_training_task(
         if accelerator.is_main_process:
             print(f"\nStarting epoch {epoch_id + 1}/{num_epochs}")
         
-        for data in tqdm(
-            dataloader, 
-            desc=f"Epoch {epoch_id + 1}/{num_epochs}", 
+        # Use explicit iterator + rank synchronization to prevent DDP deadlock.
+        # Without this, a rank that exhausts data first exits the loop while
+        # the other rank is stuck waiting for allreduce in backward().
+        data_iter = iter(dataloader)
+        pbar = tqdm(
+            desc=f"Epoch {epoch_id + 1}/{num_epochs}",
             total=len(dataset),
-            disable=not accelerator.is_main_process,  # Only show progress on main process
-        ):
+            disable=not accelerator.is_main_process,
+        )
+        step_in_epoch = 0
+        
+        while True:
+            # Fetch next batch (blocks until data is available or iterator exhausted)
+            data = next(data_iter, None)
+            
+            # Synchronize across ranks: if ANY rank has exhausted its data, ALL stop.
+            # This prevents the DDP deadlock where one rank exits while others
+            # are still calling backward() (which requires allreduce from all ranks).
+            if is_distributed:
+                local_exhausted = torch.tensor(
+                    [1 if data is None else 0],
+                    dtype=torch.long,
+                    device=accelerator.device,
+                )
+                dist.all_reduce(local_exhausted, op=dist.ReduceOp.MAX)
+                any_rank_done = local_exhausted.item() > 0
+                
+                if any_rank_done:
+                    if data is not None and accelerator.is_main_process:
+                        print(
+                            f"\n  Epoch {epoch_id}: rank sync stop at step {step_in_epoch} "
+                            f"(another rank exhausted data)"
+                        )
+                    break
+            else:
+                if data is None:
+                    break
+            
+            global_step += 1
+            step_in_epoch += 1
+            
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
                 accelerator.backward(loss)
+                if accelerator.sync_gradients and args is not None and args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1)
                 scheduler.step()
+            
+            pbar.update(1)
+        
+        pbar.close()
         
         # Synchronize at end of epoch
         accelerator.wait_for_everyone()
+        
+        if accelerator.is_main_process:
+            print(f"  Epoch {epoch_id + 1} completed: {step_in_epoch} steps")
         
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)

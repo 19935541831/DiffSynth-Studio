@@ -88,6 +88,17 @@ class ModelLogger:
         """Reset speed tracking after logging."""
         self.last_log_time = time.time()
         self.num_samples_since_last_log = 0
+    
+    def _compute_grad_norm(self, model: torch.nn.Module, norm_type: float = 2.0):
+        """Compute gradient norm for all trainable parameters."""
+        grad_norms = []
+        for param in model.parameters():
+            if param.requires_grad and param.grad is not None:
+                grad_norms.append(param.grad.detach().norm(norm_type))
+        if not grad_norms:
+            return None
+        total_norm = torch.norm(torch.stack(grad_norms), norm_type)
+        return total_norm.item()
 
     def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
         self.num_steps += 1
@@ -107,6 +118,11 @@ class ModelLogger:
             optimizer = kwargs.get('optimizer', None)
             if optimizer is not None:
                 metrics['train/learning_rate'] = optimizer.param_groups[0]['lr']
+            
+            # Gradient norm
+            grad_norm = self._compute_grad_norm(model)
+            if grad_norm is not None:
+                metrics['train/grad_norm'] = grad_norm
             
             # GPU memory (fast operation)
             gpu_allocated, gpu_reserved = self._get_gpu_memory()
