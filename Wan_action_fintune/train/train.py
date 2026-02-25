@@ -138,6 +138,7 @@ def wan_parser():
     parser.add_argument("--shuffle_buffer_size", type=int, default=1000, help="Size of shuffle buffer for streaming randomization (default: 1000).")
     parser.add_argument("--dataloader_seed", type=int, default=None, help="Random seed for dataloader shuffling.")
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Number of batches to prefetch per worker (default: 4).")
+    parser.add_argument("--warmup_steps", type=int, default=0, help="Number of linear LR warmup steps (default: 0, disabled).")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping. Set <=0 to disable clipping.")
     # WandB parameters
     parser.add_argument("--enable_wandb", default=True, action="store_true", help="Enable WandB logging.")
@@ -227,9 +228,19 @@ def launch_streaming_training_task(
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
+        warmup_steps = args.warmup_steps
+    else:
+        warmup_steps = 0
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    if warmup_steps > 0:
+        # Linearly increase LR from near-zero to target LR in warmup phase, then keep constant.
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(float(step + 1) / float(warmup_steps), 1.0),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     
     # Create dataloader for streaming dataset
     # Note: shuffle=False for IterableDataset (it handles its own shuffling)
@@ -327,10 +338,14 @@ def launch_streaming_training_task(
                 optimizer.zero_grad()
                 loss = model(data)
                 accelerator.backward(loss)
+                grad_norm_to_log = None
                 if accelerator.sync_gradients and args is not None and args.max_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    pre_clip_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    if isinstance(pre_clip_norm, torch.Tensor):
+                        pre_clip_norm = pre_clip_norm.item()
+                    grad_norm_to_log = min(float(pre_clip_norm), args.max_grad_norm)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1)
+                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1, grad_norm=grad_norm_to_log)
                 scheduler.step()
             
             pbar.update(1)

@@ -119,8 +119,8 @@ class ModelLogger:
             if optimizer is not None:
                 metrics['train/learning_rate'] = optimizer.param_groups[0]['lr']
             
-            # Gradient norm
-            grad_norm = self._compute_grad_norm(model)
+            # Gradient norm — use explicitly passed post-clip value if available
+            grad_norm = kwargs.get('grad_norm', None)
             if grad_norm is not None:
                 metrics['train/grad_norm'] = grad_norm
             

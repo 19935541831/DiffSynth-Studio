@@ -54,6 +54,130 @@ from diffsynth.core.data.parquet_utils import (
 )
 
 
+def get_action_layout_indices(
+    action_dim: int,
+    left_arm_dim: int,
+    right_arm_dim: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Infer arm/gripper indices from action layout:
+    [left_arm, left_gripper(1), right_arm, right_gripper(1)]
+    """
+    expected_dim = left_arm_dim + 1 + right_arm_dim + 1
+    if action_dim != expected_dim:
+        raise ValueError(
+            f"Action dim mismatch: got {action_dim}, expected {expected_dim} "
+            f"(left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim})"
+        )
+
+    left_arm_indices = list(range(0, left_arm_dim))
+    right_arm_start = left_arm_dim + 1
+    right_arm_indices = list(range(right_arm_start, right_arm_start + right_arm_dim))
+    arm_indices = left_arm_indices + right_arm_indices
+
+    gripper_indices = [left_arm_dim, action_dim - 1]
+    return arm_indices, gripper_indices
+
+
+def compute_arm_stats_from_arrays(
+    action_arrays: List[np.ndarray],
+    left_arm_dim: int,
+    right_arm_dim: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute dataset-level min/max stats for arm dimensions only.
+    """
+    arm_min = None
+    arm_max = None
+    arm_indices = None
+    gripper_indices = None
+
+    for actions in action_arrays:
+        if actions.ndim != 2:
+            raise ValueError(f"Actions must be 2D, got shape={actions.shape}")
+        if len(actions) == 0:
+            continue
+
+        curr_arm_indices, curr_gripper_indices = get_action_layout_indices(
+            action_dim=actions.shape[1],
+            left_arm_dim=left_arm_dim,
+            right_arm_dim=right_arm_dim,
+        )
+        if arm_indices is None:
+            arm_indices = curr_arm_indices
+            gripper_indices = curr_gripper_indices
+
+        arm_values = actions[:, arm_indices]
+        curr_min = np.min(arm_values, axis=0)
+        curr_max = np.max(arm_values, axis=0)
+
+        if arm_min is None:
+            arm_min = curr_min
+            arm_max = curr_max
+        else:
+            arm_min = np.minimum(arm_min, curr_min)
+            arm_max = np.maximum(arm_max, curr_max)
+
+    if arm_min is None or arm_max is None or arm_indices is None or gripper_indices is None:
+        raise ValueError("No valid action data found for computing normalization stats")
+
+    return {
+        "arm_min": arm_min.astype(np.float32),
+        "arm_max": arm_max.astype(np.float32),
+        "arm_indices": np.array(arm_indices, dtype=np.int32),
+        "gripper_indices": np.array(gripper_indices, dtype=np.int32),
+    }
+
+
+def normalize_arm_action(
+    action: np.ndarray,
+    arm_indices: np.ndarray,
+    arm_min: np.ndarray,
+    arm_max: np.ndarray,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    Normalize arm dimensions to [-1, 1], keep gripper dimensions unchanged.
+    """
+    action = action.astype(np.float32, copy=True)
+    denom = np.maximum(arm_max - arm_min, eps)
+    action_arm = action[arm_indices]
+    action_arm_norm = 2.0 * (action_arm - arm_min) / denom - 1.0
+    action[arm_indices] = np.clip(action_arm_norm, -1.0, 1.0)
+    return action
+
+
+def save_normalization_params(
+    output_dir: str,
+    stats_filename: str,
+    left_arm_dim: int,
+    right_arm_dim: int,
+    arm_indices: np.ndarray,
+    gripper_indices: np.ndarray,
+    arm_min: np.ndarray,
+    arm_max: np.ndarray,
+):
+    """
+    Save normalization parameters for reuse in training/inference.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    stats_path = os.path.join(output_dir, stats_filename)
+    payload = {
+        "layout": "left_arm,left_gripper,right_arm,right_gripper",
+        "left_arm_dim": left_arm_dim,
+        "right_arm_dim": right_arm_dim,
+        "arm_indices": arm_indices.tolist(),
+        "gripper_indices": gripper_indices.tolist(),
+        "arm_min": arm_min.tolist(),
+        "arm_max": arm_max.tolist(),
+        "normalize_range": [-1.0, 1.0],
+        "gripper_range_assumed": [0.0, 1.0],
+    }
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"Saved normalization params: {stats_path}")
+
+
 def load_joint_action_hdf5(hdf5_path: str) -> np.ndarray:
     """
     Load and concatenate joint action data from HDF5 file (RoboTwin format).
@@ -198,6 +322,9 @@ def convert_robotwin_to_parquet(
     jpeg_quality: int = 95,
     instruction_mode: str = "random",
     seed: int = 42,
+    left_arm_dim: int = 6,
+    right_arm_dim: int = 6,
+    stats_filename: str = "action_normalization.json",
 ):
     """
     Convert RoboTwin raw dataset to Parquet format.
@@ -225,6 +352,31 @@ def convert_robotwin_to_parquet(
     print("Scanning for episodes...")
     episodes = find_robotwin_episodes(raw_data_dir)
     print(f"Found {len(episodes)} episodes")
+    print()
+
+    # Pass 1: Compute global arm min/max stats
+    print("Computing action normalization stats (arm dims only)...")
+    robotwin_actions = []
+    for _, _, _, hdf5_path, _ in tqdm(episodes, desc="Scanning actions"):
+        try:
+            robotwin_actions.append(load_joint_action_hdf5(hdf5_path))
+        except Exception as e:
+            print(f"Warning: failed to load actions from {hdf5_path}: {e}")
+    stats = compute_arm_stats_from_arrays(
+        action_arrays=robotwin_actions,
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
+    )
+    save_normalization_params(
+        output_dir=output_dir,
+        stats_filename=stats_filename,
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
+        arm_indices=stats["arm_indices"],
+        gripper_indices=stats["gripper_indices"],
+        arm_min=stats["arm_min"],
+        arm_max=stats["arm_max"],
+    )
     print()
     
     # Create writer
@@ -258,6 +410,12 @@ def convert_robotwin_to_parquet(
                 
                 # Write frames
                 for frame_idx, (frame, action) in enumerate(zip(frames, actions)):
+                    action = normalize_arm_action(
+                        action=action,
+                        arm_indices=stats["arm_indices"],
+                        arm_min=stats["arm_min"],
+                        arm_max=stats["arm_max"],
+                    )
                     writer.write_frame(
                         episode_id=episode_id,
                         task_name=task_name,
@@ -288,6 +446,9 @@ def convert_csv_to_parquet(
     prompt_col: str = "prompt",
     task_col: Optional[str] = "task",
     episode_col: Optional[str] = "episode",
+    left_arm_dim: int = 7,
+    right_arm_dim: int = 7,
+    stats_filename: str = "action_normalization.json",
 ):
     """
     Convert processed CSV format dataset to Parquet.
@@ -315,6 +476,34 @@ def convert_csv_to_parquet(
     # Load CSV
     df = pd.read_csv(csv_path)
     print(f"Found {len(df)} entries in CSV")
+    print()
+
+    # Pass 1: Compute global arm min/max stats
+    print("Computing action normalization stats (arm dims only)...")
+    csv_actions = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Scanning actions"):
+        action_path = row[action_col]
+        if not os.path.isabs(action_path):
+            action_path = os.path.join(base_path, action_path)
+        try:
+            csv_actions.append(np.load(action_path).astype(np.float32))
+        except Exception as e:
+            print(f"Warning: failed to load actions from {action_path}: {e}")
+    stats = compute_arm_stats_from_arrays(
+        action_arrays=csv_actions,
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
+    )
+    save_normalization_params(
+        output_dir=output_dir,
+        stats_filename=stats_filename,
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
+        arm_indices=stats["arm_indices"],
+        gripper_indices=stats["gripper_indices"],
+        arm_min=stats["arm_min"],
+        arm_max=stats["arm_max"],
+    )
     print()
     
     # Create writer
@@ -352,6 +541,12 @@ def convert_csv_to_parquet(
                 
                 # Write frames
                 for frame_idx, (frame, action) in enumerate(zip(frames, actions)):
+                    action = normalize_arm_action(
+                        action=action,
+                        arm_indices=stats["arm_indices"],
+                        arm_min=stats["arm_min"],
+                        arm_max=stats["arm_max"],
+                    )
                     writer.write_frame(
                         episode_id=episode_id,
                         task_name=task_name,
@@ -442,6 +637,24 @@ def main():
     parser.add_argument("--prompt_col", type=str, default="prompt", help="CSV column for instructions")
     parser.add_argument("--task_col", type=str, default="task", help="CSV column for task name")
     parser.add_argument("--episode_col", type=str, default="episode", help="CSV column for episode index")
+    parser.add_argument(
+        "--left_arm_dim",
+        type=int,
+        default=6,
+        help="Left arm action dimensions (default: 7)"
+    )
+    parser.add_argument(
+        "--right_arm_dim",
+        type=int,
+        default=6,
+        help="Right arm action dimensions (default: 7)"
+    )
+    parser.add_argument(
+        "--norm_stats_filename",
+        type=str,
+        default="action_normalization.json",
+        help="Filename for saving normalization params in output_dir"
+    )
     
     args = parser.parse_args()
     
@@ -456,6 +669,9 @@ def main():
             jpeg_quality=args.jpeg_quality,
             instruction_mode=args.instruction_mode,
             seed=args.seed,
+            left_arm_dim=args.left_arm_dim,
+            right_arm_dim=args.right_arm_dim,
+            stats_filename=args.norm_stats_filename,
         )
         
     elif args.mode == "csv":
@@ -473,6 +689,9 @@ def main():
             prompt_col=args.prompt_col,
             task_col=args.task_col,
             episode_col=args.episode_col,
+            left_arm_dim=args.left_arm_dim,
+            right_arm_dim=args.right_arm_dim,
+            stats_filename=args.norm_stats_filename,
         )
 
 
