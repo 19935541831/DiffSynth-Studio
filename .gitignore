@@ -17,6 +17,8 @@
 *.hdf5
 *.csv
 *.parquet
+*.npy
+*.txt
 log*.txt
 
 # Byte-compiled / optimized / DLL files

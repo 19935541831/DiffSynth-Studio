@@ -615,8 +615,8 @@ def main():
     parser.add_argument(
         "--jpeg_quality",
         type=int,
-        default=95,
-        help="JPEG compression quality 1-100 (default: 95)"
+        default=100,
+        help="JPEG compression quality 1-100 (default: 100)"
     )
     parser.add_argument(
         "--instruction_mode",
@@ -641,13 +641,13 @@ def main():
         "--left_arm_dim",
         type=int,
         default=6,
-        help="Left arm action dimensions (default: 7)"
+        help="Left arm action dimensions (default: 6)"
     )
     parser.add_argument(
         "--right_arm_dim",
         type=int,
         default=6,
-        help="Right arm action dimensions (default: 7)"
+        help="Right arm action dimensions (default: 6)"
     )
     parser.add_argument(
         "--norm_stats_filename",

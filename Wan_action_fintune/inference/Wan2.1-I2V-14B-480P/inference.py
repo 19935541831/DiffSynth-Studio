@@ -96,7 +96,7 @@ def load_combined_checkpoint(pipe, checkpoint_path):
 
     if lora_state_dict:
         print(f"  -> {len(lora_state_dict)} LoRA tensors found, loading...")
-        pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1.2)
+        pipe.load_lora(pipe.dit, state_dict=lora_state_dict, alpha=1)
         print("  LoRA weights loaded successfully.")
     else:
         print("  Warning: no LoRA weights found in checkpoint.")
@@ -411,7 +411,7 @@ def main():
                 num_inference_steps=args.num_inference_steps,
                 cfg_scale=args.cfg_scale,
                 seed=args.seed,
-                tiled=True,
+                tiled=False,
             )
             
             # Save video
@@ -431,3 +431,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+CUDA_VISIBLE_DEVICES=2 python /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/inference/Wan2.1-I2V-14B-480P/inference.py \
+--csv_path /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/inference/short_video_infer/inference_input.csv \
+--model_dir /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/checkpoints/Wan2.1-I2V-14B-480P \
+--checkpoint_path /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/checkpoints/Wan2.1-I2V-14B-480P_lora_1/epoch-4.safetensors \
+--output_dir /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/inference/short_video_infer/outputs \
+--quality 10 \
+--action_norm_file /opt/tiger/workspace/DiffSynth-Studio/Wan_action_fintune/data/norm/action_normalization.json
+"""

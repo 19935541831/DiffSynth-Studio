@@ -10,6 +10,7 @@ from diffsynth.core.data.parquet_streaming_dataset import (
     collate_robot_batch,
 )
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.models.wan_video_action_encoder import WanActionEncoder
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -23,6 +24,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self,
         model_paths=None, model_id_with_origin_paths=None,
         tokenizer_path=None, audio_processor_path=None,
+        disable_prompt=False,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
@@ -35,6 +37,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        action_joint_dim=None,
     ):
         super().__init__()
         # Warning
@@ -47,6 +50,36 @@ class WanTrainingModule(DiffusionTrainingModule):
         tokenizer_config = ModelConfig(tokenizer_path) if tokenizer_path is not None else None
         audio_processor_config = ModelConfig(audio_processor_path) if audio_processor_path is not None else None
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+
+        self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        trainable_model_list = trainable_models.split(",") if trainable_models is not None else []
+        need_action_encoder = ("action_seq" in self.extra_inputs) or ("action_encoder" in trainable_model_list)
+        if need_action_encoder:
+            if self.pipe.action_encoder is None:
+                if action_joint_dim is None:
+                    raise ValueError(
+                        "action conditioning is enabled, but no action encoder was loaded. "
+                        "Please either add an action encoder checkpoint into --model_paths, "
+                        "or provide --action_joint_dim to initialize a new action encoder."
+                    )
+                self.pipe.action_encoder = WanActionEncoder(
+                    joint_dim=action_joint_dim,
+                    dit_dim=self.pipe.dit.dim,
+                ).to(device=device)
+            else:
+                if hasattr(self.pipe.action_encoder, "dit_dim") and self.pipe.action_encoder.dit_dim != self.pipe.dit.dim:
+                    raise ValueError(
+                        f"action encoder dit_dim mismatch: got {self.pipe.action_encoder.dit_dim}, "
+                        f"but dit.dim is {self.pipe.dit.dim}. "
+                        "Please use an action encoder checkpoint matching the current DiT, "
+                        "or remove it and pass --action_joint_dim to initialize a compatible one."
+                    )
+                if action_joint_dim is not None and hasattr(self.pipe.action_encoder, "joint_dim") and self.pipe.action_encoder.joint_dim != action_joint_dim:
+                    raise ValueError(
+                        f"action encoder joint_dim mismatch: got {self.pipe.action_encoder.joint_dim}, "
+                        f"but --action_joint_dim={action_joint_dim}."
+                    )
+
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
         # Training mode
@@ -60,9 +93,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
-        self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        self.disable_prompt = disable_prompt
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -89,7 +122,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         return inputs_shared
     
     def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
+        prompt = "" if self.disable_prompt else data.get("prompt", "")
+        inputs_posi = {"prompt": prompt}
         inputs_nega = {}
         inputs_shared = {
             # Assume you are using this pipeline for inference,
@@ -127,6 +161,7 @@ def wan_parser():
     parser = add_general_config(parser)
     parser = add_video_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument("--disable_prompt", default=False, action="store_true", help="Disable text prompt conditioning during training by replacing prompts with empty strings.")
     parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to the audio processor. If provided, the processor will be used for Wan2.2-S2V model.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
@@ -140,6 +175,7 @@ def wan_parser():
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Number of batches to prefetch per worker (default: 4).")
     parser.add_argument("--warmup_steps", type=int, default=0, help="Number of linear LR warmup steps (default: 0, disabled).")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping. Set <=0 to disable clipping.")
+    parser.add_argument("--action_encoder_learning_rate", type=float, default=None, help="Independent learning rate for action_encoder parameters. Defaults to --learning_rate when not set.")
     # WandB parameters
     parser.add_argument("--enable_wandb", default=True, action="store_true", help="Enable WandB logging.")
     parser.add_argument("--disable_wandb", dest="enable_wandb", action="store_false", help="Disable WandB logging.")
@@ -224,15 +260,46 @@ def launch_streaming_training_task(
     
     if args is not None:
         learning_rate = args.learning_rate
+        action_encoder_learning_rate = args.action_encoder_learning_rate
         weight_decay = args.weight_decay
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
         warmup_steps = args.warmup_steps
     else:
+        action_encoder_learning_rate = None
         warmup_steps = 0
+
+    action_encoder_learning_rate = learning_rate if action_encoder_learning_rate is None else action_encoder_learning_rate
     
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    trainable_named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    action_encoder_named_params = [(name, p) for name, p in trainable_named_params if "action_encoder" in name]
+    base_named_params = [(name, p) for name, p in trainable_named_params if "action_encoder" not in name]
+
+    if len(action_encoder_named_params) > 0 and len(base_named_params) > 0:
+        optimizer_param_groups = [
+            {
+                "params": [p for _, p in base_named_params],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+                "group_name": "base",
+            },
+            {
+                "params": [p for _, p in action_encoder_named_params],
+                "lr": action_encoder_learning_rate,
+                "weight_decay": weight_decay,
+                "group_name": "action_encoder",
+            },
+        ]
+    else:
+        optimizer_param_groups = [{
+            "params": [p for _, p in trainable_named_params],
+            "lr": learning_rate,
+            "weight_decay": weight_decay,
+            "group_name": "base",
+        }]
+
+    optimizer = torch.optim.AdamW(optimizer_param_groups)
     if warmup_steps > 0:
         # Linearly increase LR from near-zero to target LR in warmup phase, then keep constant.
         scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -304,6 +371,7 @@ def launch_streaming_training_task(
         )
         step_in_epoch = 0
         
+        optimizer.zero_grad()
         while True:
             # Fetch next batch (blocks until data is available or iterator exhausted)
             data = next(data_iter, None)
@@ -331,11 +399,9 @@ def launch_streaming_training_task(
                 if data is None:
                     break
             
-            global_step += 1
             step_in_epoch += 1
             
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
                 loss = model(data)
                 accelerator.backward(loss)
                 grad_norm_to_log = None
@@ -343,10 +409,22 @@ def launch_streaming_training_task(
                     pre_clip_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     if isinstance(pre_clip_norm, torch.Tensor):
                         pre_clip_norm = pre_clip_norm.item()
-                    grad_norm_to_log = min(float(pre_clip_norm), args.max_grad_norm)
+                    if pre_clip_norm is not None:
+                        grad_norm_to_log = min(float(pre_clip_norm), args.max_grad_norm)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, optimizer=optimizer, batch_size=1, grad_norm=grad_norm_to_log)
                 scheduler.step()
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    model_logger.on_step_end(
+                        accelerator,
+                        model,
+                        save_steps,
+                        loss=loss,
+                        optimizer=optimizer,
+                        batch_size=accelerator.gradient_accumulation_steps,
+                        grad_norm=grad_norm_to_log,
+                    )
+                optimizer.zero_grad()
             
             pbar.update(1)
         
@@ -392,6 +470,7 @@ if __name__ == "__main__":
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
+        disable_prompt=args.disable_prompt,
         audio_processor_path=args.audio_processor_path,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
@@ -409,6 +488,7 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        action_joint_dim=args.action_joint_dim,
     )
     
     # Create model logger (only initialize wandb on main process)

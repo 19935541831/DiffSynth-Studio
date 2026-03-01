@@ -438,21 +438,31 @@ class WanVideoUnit_ActionEmbedder(PipelineUnit):
         if action_seq is None or pipe.action_encoder is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        T_video, _ = action_seq.shape
+        if action_seq.ndim == 2:
+            action_seq = action_seq.unsqueeze(0)
+        elif action_seq.ndim == 3:
+            pass
+        else:
+            raise ValueError(f"action_seq should have shape (T, D) or (B, T, D), but got {tuple(action_seq.shape)}")
+        _, T_video, D_joint = action_seq.shape
         assert T_video == num_frames, f"action_seq has {T_video} frames, but num_frames={num_frames}"
 
-        # Add batch dimension: (T, D) -> (1, T, D)
-        action_seq = action_seq.unsqueeze(0).to(pipe.device, dtype=pipe.torch_dtype)
+        # Pack 4 frames into one token after prepending 3 copies of the first frame.
+        # This maps video frames T -> latent frames (T-1)//4+1 while preserving local motion context.
+        first_frame = action_seq[:, :1, :]
+        action_seq = torch.cat([first_frame.repeat(1, 3, 1), action_seq], dim=1)
+        if action_seq.shape[1] % 4 != 0:
+            raise ValueError(f"packed action sequence length must be divisible by 4, but got {action_seq.shape[1]}")
+        action_seq = action_seq.reshape(action_seq.shape[0], action_seq.shape[1] // 4, 4 * D_joint)
+
+        T_latent = (num_frames - 1) // 4 + 1
+        if action_seq.shape[1] != T_latent:
+            raise ValueError(f"packed action_seq has {action_seq.shape[1]} frames, but expected T_latent={T_latent}")
+
+        action_seq = action_seq.to(pipe.device, dtype=pipe.torch_dtype)
 
         # Encode to DiT dimension
-        action_emb = pipe.action_encoder(action_seq)  # (1, T_video, D)
-
-        # Downsample to latent temporal dimension: T_latent = (num_frames - 1) // 4 + 1
-        T_latent = (num_frames - 1) // 4 + 1
-        if T_video != T_latent:
-            action_emb = torch.nn.functional.interpolate(
-                action_emb.permute(0, 2, 1), size=T_latent, mode='linear'
-            ).permute(0, 2, 1)  # (1, T_latent, D)
+        action_emb = pipe.action_encoder(action_seq)
 
         return {"action_emb": action_emb}
 
@@ -1298,7 +1308,7 @@ def model_fn_wan_video(
             timestep_per_token = torch.cat([
                 torch.full((1, per_frame_tokens), 0.0, device=latents.device),
                 timestep.repeat(T_latent - 1, per_frame_tokens)
-            ], dim=0).flatten()  # (T_latent * h * w,)
+            ], dim=0).flatten().to(dtype=timestep.dtype)  # (T_latent * h * w,)
             t_raw = sinusoidal_embedding_1d(dit.freq_dim, timestep_per_token)  # (S_no_ref, freq_dim)
             t = dit.time_embedding(t_raw).unsqueeze(0).expand(B, -1, -1)  # (B, S_no_ref, D)
         else:

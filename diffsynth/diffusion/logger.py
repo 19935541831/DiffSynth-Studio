@@ -118,6 +118,10 @@ class ModelLogger:
             optimizer = kwargs.get('optimizer', None)
             if optimizer is not None:
                 metrics['train/learning_rate'] = optimizer.param_groups[0]['lr']
+                for param_group in optimizer.param_groups:
+                    if param_group.get('group_name', '') == 'action_encoder':
+                        metrics['train/action_encoder_learning_rate'] = param_group['lr']
+                        break
             
             # Gradient norm — use explicitly passed post-clip value if available
             grad_norm = kwargs.get('grad_norm', None)

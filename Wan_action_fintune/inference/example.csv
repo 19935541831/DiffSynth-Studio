@@ -1,3 +1,0 @@
-prompt,input_image,action_seq
-Take the green bottle with indented base from the table and keep upright,/project/peilab/Puxin/Wan_action/data/robotwin_dataset_train_episode0/videos/clip_000000.mp4,/project/peilab/Puxin/Wan_action/data/robotwin_dataset_train_episode0/actions/clip_000000.npy
-Utilize the left arm to lift the medium green bottle with capped neck while keeping it head-up.,/project/peilab/Puxin/Wan_action/data/robotwin_dataset_train_episode0/videos/clip_000001.mp4,/project/peilab/Puxin/Wan_action/data/robotwin_dataset_train_episode0/actions/clip_000001.npy
