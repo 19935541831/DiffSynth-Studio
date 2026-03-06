@@ -1,0 +1,19 @@
+# ODE regression stage: train causal student on teacher ODE trajectories
+
+data_dir: null          # directory of .pt trajectory files (ode_latent, prompt, action_seq)
+output_dir: ./ode_ckpts
+model_dir: null         # optional; Wan pipeline model root
+generator_ckpt: null    # optional; resume student from this checkpoint
+
+batch_size: 2
+lr: 1.0e-4
+beta1: 0.9
+beta2: 0.999
+max_steps: 10000
+save_every: 1000
+max_samples: null       # cap dataset size
+
+num_frame_per_block: 1
+joint_dim: 14
+num_ode_steps: 50       # scheduler steps (trajectory length = num_ode_steps + 1)
+mixed_precision: false

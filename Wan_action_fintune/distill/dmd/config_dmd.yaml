@@ -1,0 +1,30 @@
+# DMD stage: generator (causal student) + backward simulation + teacher real/fake score
+
+data_dir: null          # directory of .pt files with prompt + action_seq (same format as ODE data)
+output_dir: ./dmd_ckpts
+model_dir: null
+generator_ckpt: null    # optional; e.g. ODE-stage checkpoint
+
+batch_size: 2
+lr: 1.0e-4
+beta1: 0.9
+beta2: 0.999
+max_steps: 5000
+save_every: 500
+dfake_gen_update_ratio: 1
+train_critic: false     # set true to also train teacher as critic (usually false)
+
+num_frame_per_block: 1
+joint_dim: 14
+height: 480
+width: 832
+num_frames: 81
+image_or_video_shape: "1,21,16,30,52"   # B, F, C, H, W latent shape
+
+num_inference_steps: 50
+sigma_shift: 5.0
+denoising_step_list: null   # null = use 0..num_inference_steps-1
+num_train_timestep: 1000
+real_guidance_scale: 1.0
+backward_simulation: true
+mixed_precision: false
