@@ -158,6 +158,17 @@ class ModelLogger:
             accelerator.save(state_dict, path, safe_serialization=True)
 
 
+    def on_validation_end(self, accelerator: Accelerator, val_loss: float, step: int = None):
+        if not self.wandb_initialized or (not accelerator.is_main_process):
+            return
+        if step is None:
+            step = self.num_steps
+        try:
+            wandb.log({"val/loss": float(val_loss)}, step=step)
+        except Exception as e:
+            print(f"Validation logging error: {e}")
+
+
     def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")

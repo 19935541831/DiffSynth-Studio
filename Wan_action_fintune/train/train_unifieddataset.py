@@ -3,6 +3,7 @@ from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath, LoadActionSequence
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
+from diffsynth.models.wan_video_action_encoder import WanActionEncoder
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -24,6 +25,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        action_joint_dim=None
     ):
         super().__init__()
         # Warning
@@ -36,6 +38,36 @@ class WanTrainingModule(DiffusionTrainingModule):
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = ModelConfig(audio_processor_path) if audio_processor_path is not None else None
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        
+        self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        trainable_model_list = trainable_models.split(",") if trainable_models is not None else []
+        need_action_encoder = ("action_seq" in self.extra_inputs) or ("action_encoder" in trainable_model_list)
+        if need_action_encoder:
+            if self.pipe.action_encoder is None:
+                if action_joint_dim is None:
+                    raise ValueError(
+                        "action conditioning is enabled, but no action encoder was loaded. "
+                        "Please either add an action encoder checkpoint into --model_paths, "
+                        "or provide --action_joint_dim to initialize a new action encoder."
+                    )
+                self.pipe.action_encoder = WanActionEncoder(
+                    joint_dim=action_joint_dim,
+                    dit_dim=self.pipe.dit.dim,
+                ).to(device=device)
+                print(f"Initialized a new WanActionEncoder with joint_dim={action_joint_dim} and dit_dim={self.pipe.dit.dim}.")
+            else:
+                if hasattr(self.pipe.action_encoder, "dit_dim") and self.pipe.action_encoder.dit_dim != self.pipe.dit.dim:
+                    raise ValueError(
+                        f"action encoder dit_dim mismatch: got {self.pipe.action_encoder.dit_dim}, "
+                        f"but dit.dim is {self.pipe.dit.dim}. "
+                        "Please use an action encoder checkpoint matching the current DiT, "
+                        "or remove it and pass --action_joint_dim to initialize a compatible one."
+                    )
+                if action_joint_dim is not None and hasattr(self.pipe.action_encoder, "joint_dim") and self.pipe.action_encoder.joint_dim != action_joint_dim:
+                    raise ValueError(
+                        f"action encoder joint_dim mismatch: got {self.pipe.action_encoder.joint_dim}, "
+                        f"but --action_joint_dim={action_joint_dim}."
+                    )        
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
         # Training mode
@@ -125,6 +157,9 @@ def wan_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--action_joint_dim", type=int, default=None, help="Dimension of the action sequence vectors (D). If not provided, it will be inferred.")
     parser.add_argument("--window_stride", type=int, default=1, help="Stride for sliding window sampling (default: 1, maximum overlap).")
+    parser.add_argument("--val_dataset_metadata_path", type=str, default=None, help="Path to validation metadata file. If not provided, validation is disabled.")
+    parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N optimizer steps. If None, validation is disabled.")
+    parser.add_argument("--validation_num_batches", type=int, default=None, help="Maximum validation batches per validation run. If None, evaluate full validation dataset.")
     parser.add_argument("--enable_wandb", default=True, action="store_true", help="Enable WandB logging.")
     parser.add_argument("--disable_wandb", dest="enable_wandb", action="store_false", help="Disable WandB logging.")
     parser.add_argument("--wandb_log_interval", type=int, default=10, help="Log metrics to WandB every N steps (default: 10).")
@@ -138,6 +173,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.window_stride <= 0:
         raise ValueError("--window_stride must be >= 1")
+    if args.validation_steps is not None and args.validation_steps <= 0:
+        raise ValueError("--validation_steps must be >= 1")
+    if args.validation_num_batches is not None and args.validation_num_batches <= 0:
+        raise ValueError("--validation_num_batches must be >= 1")
 
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -166,6 +205,31 @@ if __name__ == "__main__":
         window_num_frames=args.num_frames,
         window_stride=args.window_stride,
     )
+    val_dataset = None
+    if args.val_dataset_metadata_path is not None:
+        val_dataset = UnifiedDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.val_dataset_metadata_path,
+            repeat=1,
+            data_file_keys=args.data_file_keys.split(","),
+            main_data_operator=UnifiedDataset.default_video_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+                num_frames=args.num_frames,
+                time_division_factor=4,
+                time_division_remainder=1,
+            ),
+            special_operator_map={
+                "action_seq": ToAbsolutePath(args.dataset_base_path) >> LoadActionSequence(joint_dim=args.action_joint_dim),
+            },
+            enable_sliding_window=True,
+            window_num_frames=args.num_frames,
+            window_stride=args.window_stride,
+        )
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -188,6 +252,7 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        action_joint_dim=args.action_joint_dim,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -206,6 +271,9 @@ if __name__ == "__main__":
             "lora_rank": args.lora_rank,
             "trainable_models": args.trainable_models,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "validation_steps": args.validation_steps,
+            "validation_num_batches": args.validation_num_batches,
+            "val_dataset_metadata_path": args.val_dataset_metadata_path,
         },
     )
     launcher_map = {
@@ -216,4 +284,16 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    if args.task.endswith(":data_process"):
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    else:
+        launcher_map[args.task](
+            accelerator,
+            dataset,
+            model,
+            model_logger,
+            validation_dataset=val_dataset,
+            validation_steps=args.validation_steps,
+            validation_num_batches=args.validation_num_batches,
+            args=args,
+        )
